@@ -7,8 +7,10 @@ from typing import List
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.config.astrbot_config import AstrBotConfig
+from astrbot.core.message.components import Plain
 
 
 class CallMePlugin(Star):
@@ -99,6 +101,36 @@ class CallMePlugin(Star):
                 logger.info(f"[CallMe] 已同步唤醒名字到系统配置: {names}")
         except Exception as e:
             logger.error(f"[CallMe] 同步唤醒前缀失败: {e}")
+
+    @filter.on_llm_request()
+    async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
+        original_text = ""
+        for comp in event.get_messages():
+            if isinstance(comp, (Plain,)) and comp.text:
+                original_text += comp.text
+
+        original_text = original_text.strip()
+        if not original_text:
+            return
+
+        matched_name = self._match_name(original_text)
+        if not matched_name:
+            return
+
+        remaining = original_text[len(matched_name):].strip()
+        if not remaining:
+            event.stop_event()
+            return
+
+        self_id = event.get_self_id()
+        if self_id:
+            req.prompt = f"[CQ:at,qq={self_id}] {remaining}"
+        else:
+            req.prompt = remaining
+
+        logger.debug(
+            f"[CallMe] 名字唤醒「{matched_name}」→ 注入 @mention"
+        )
 
     @filter.command("callme")
     async def callme_cmd(self, event: AstrMessageEvent):
