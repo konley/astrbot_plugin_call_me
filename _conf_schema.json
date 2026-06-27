@@ -1,0 +1,9 @@
+{
+  "name_list": {
+    "description": "唤醒名字列表",
+    "hint": "设置 1~3 个名字，消息以此开头时会自动唤醒机器人。留空则自动检测机器人账号的 QQ 昵称。",
+    "type": "list",
+    "default": [],
+    "max_items": 3
+  }
+}

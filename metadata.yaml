@@ -1,0 +1,7 @@
+name: astrbot_plugin_call_me
+desc: "随叫随到！通过昵称或自定义名字唤醒机器人，无需 @。支持配置最多 3 个唤醒名，默认自动检测机器人昵称。"
+version: 1.0.0
+author: user
+repo: https://github.com/konley/astrbot_plugin_call_me
+display_name: 随叫随到 - 名字唤醒
+astrbot_version: ">=4.17.0"
