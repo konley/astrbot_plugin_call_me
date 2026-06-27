@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-import os
+import time
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -19,11 +19,13 @@ class CallMePlugin(Star):
         self.config = config
         self._bot_nickname = ""
         self._config_path: Path | None = None
+        self._dedup: Dict[str, float] = {}
+        self._dedup_window = 60
 
     async def initialize(self) -> None:
         self._bot_nickname = await self._detect_nickname()
         self._config_path = await self._resolve_config_path()
-        self._sync_wake_prefixes()
+        self._clean_stale_wake_prefixes()
 
     async def _resolve_config_path(self) -> Path | None:
         try:
@@ -49,6 +51,18 @@ class CallMePlugin(Star):
         except Exception as e:
             logger.error(f"[CallMe] 保存配置失败: {e}")
 
+    def _clean_stale_wake_prefixes(self) -> None:
+        try:
+            core_config = self.context._config
+            names = self._get_names()
+            wake_prefixes = core_config.get("wake_prefix", ["/"])
+            cleaned = [p for p in wake_prefixes if p not in names]
+            if len(cleaned) != len(wake_prefixes):
+                core_config["wake_prefix"] = cleaned
+                logger.info("[CallMe] 已清理 core config 中残留的唤醒名字")
+        except Exception as e:
+            logger.debug(f"[CallMe] 清理残留前缀失败: {e}")
+
     async def _detect_nickname(self) -> str:
         try:
             pm = getattr(self.context, "platform_manager", None)
@@ -66,9 +80,7 @@ class CallMePlugin(Star):
                         info = await bot.get_login_info()
                         nick = info.get("nickname", "")
                         if nick:
-                            logger.info(
-                                f"[CallMe] 检测到机器人昵称: {nick}"
-                            )
+                            logger.info(f"[CallMe] 检测到机器人昵称: {nick}")
                             return nick
         except Exception as e:
             logger.debug(f"[CallMe] 自动检测昵称失败: {e}")
@@ -83,42 +95,62 @@ class CallMePlugin(Star):
             names = [self._bot_nickname]
         return names[:3]
 
-    def _sync_wake_prefixes(self) -> None:
-        try:
-            names = self._get_names()
-            if not names:
-                return
+    def _match_name(self, text: str) -> str | None:
+        for name in self._get_names():
+            if text.startswith(name):
+                return name
+        return None
 
-            core_config = self.context._config
-            wake_prefixes = core_config.get("wake_prefix", ["/"])
+    def _dedup_key(self, event: AstrMessageEvent) -> str:
+        return f"{event.unified_msg_origin}_{event.get_sender_id()}"
 
-            for name in names:
-                if name not in wake_prefixes:
-                    wake_prefixes.append(name)
+    def _is_dedup(self, event: AstrMessageEvent) -> bool:
+        key = self._dedup_key(event)
+        now = time.time()
+        last = self._dedup.get(key, 0)
+        if now - last < self._dedup_window:
+            return True
+        self._dedup[key] = now
+        return False
 
-            core_config["wake_prefix"] = wake_prefixes
-            if names:
-                logger.info(f"[CallMe] 已同步唤醒名字到系统配置: {names}")
-        except Exception as e:
-            logger.error(f"[CallMe] 同步唤醒前缀失败: {e}")
-
-    @filter.on_llm_request()
-    async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        original_text = ""
-        for comp in event.get_messages():
-            if isinstance(comp, (Plain,)) and comp.text:
-                original_text += comp.text
-
-        original_text = original_text.strip()
-        if not original_text:
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=9999)
+    async def on_message(self, event: AstrMessageEvent):
+        if event.get_self_id() == event.get_sender_id():
             return
 
-        matched_name = self._match_name(original_text)
+        text = (event.message_str or "").strip()
+        if not text:
+            return
+
+        matched_name = self._match_name(text)
         if not matched_name:
             return
 
+        setattr(event, "_call_me_name", matched_name)
+
+    @filter.on_llm_request()
+    async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
+        matched_name = getattr(event, "_call_me_name", None)
+        if not matched_name:
+            if not event.is_at_or_wake_command:
+                event.stop_event()
+            return
+
+        original_text = ""
+        for comp in event.get_messages():
+            if isinstance(comp, Plain) and comp.text:
+                original_text += comp.text
+        original_text = original_text.strip()
+
         remaining = original_text[len(matched_name):].strip()
         if not remaining:
+            event.stop_event()
+            return
+
+        if self._is_dedup(event):
+            logger.debug(
+                f"[CallMe] 去重触发，跳过 {self._dedup_key(event)}"
+            )
             event.stop_event()
             return
 
@@ -128,9 +160,7 @@ class CallMePlugin(Star):
         else:
             req.prompt = remaining
 
-        logger.debug(
-            f"[CallMe] 名字唤醒「{matched_name}」→ 注入 @mention"
-        )
+        logger.info(f"[CallMe] 名字唤醒「{matched_name}」→ 注入 @mention")
 
     @filter.command("callme")
     async def callme_cmd(self, event: AstrMessageEvent):
@@ -139,9 +169,7 @@ class CallMePlugin(Star):
         if len(parts) == 1:
             names = self._get_names()
             if names:
-                yield event.plain_result(
-                    f"当前唤醒名字：{'、'.join(names)}"
-                )
+                yield event.plain_result(f"当前唤醒名字：{'、'.join(names)}")
             else:
                 yield event.plain_result(
                     "未配置唤醒名字。可用「callme add <名字>」添加。"
@@ -183,7 +211,6 @@ class CallMePlugin(Star):
             names.append(name)
             self.config["name_list"] = names
             self._save_config()
-            self._sync_wake_prefixes()
             logger.info(f"[CallMe] 添加唤醒名字: {name}")
             yield event.plain_result(f"已添加唤醒名字「{name}」")
 
@@ -196,14 +223,11 @@ class CallMePlugin(Star):
             name = parts[2]
             names = self._get_names()
             if name not in names:
-                yield event.plain_result(
-                    f"「{name}」不在唤醒列表中"
-                )
+                yield event.plain_result(f"「{name}」不在唤醒列表中")
                 return
             names.remove(name)
             self.config["name_list"] = names
             self._save_config()
-            self._sync_wake_prefixes()
             logger.info(f"[CallMe] 移除唤醒名字: {name}")
             yield event.plain_result(f"已移除唤醒名字「{name}」")
 
@@ -213,15 +237,4 @@ class CallMePlugin(Star):
             )
 
     async def terminate(self) -> None:
-        try:
-            core_config = self.context._config
-            names = self._get_names()
-            if not names:
-                return
-            wake_prefixes = core_config.get("wake_prefix", ["/"])
-            core_config["wake_prefix"] = [
-                p for p in wake_prefixes if p not in names
-            ]
-            logger.info("[CallMe] 已清理唤醒名字")
-        except Exception as e:
-            logger.debug(f"[CallMe] 清理时异常: {e}")
+        self._clean_stale_wake_prefixes()
