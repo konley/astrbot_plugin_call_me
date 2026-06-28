@@ -124,6 +124,7 @@ class CallMePlugin(Star):
 
         matched_name = self._match_name(text)
         if not matched_name:
+            setattr(event, "_call_me_checked", True)
             return
 
         setattr(event, "_call_me_name", matched_name)
@@ -133,7 +134,8 @@ class CallMePlugin(Star):
         matched_name = getattr(event, "_call_me_name", None)
         if not matched_name:
             if not event.is_at_or_wake_command:
-                event.stop_event()
+                if not getattr(event, "_call_me_checked", False):
+                    event.stop_event()
             return
 
         original_text = ""
